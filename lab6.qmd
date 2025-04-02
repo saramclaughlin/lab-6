@@ -1,7 +1,313 @@
 ---
-title: "lab6"
+title: "Lab6"
+author: "Sara McLaughlin"
+date: "2025-04-01"
 format: html
 execute: 
   echo: true
 ---
+```{r}
+library(ggthemes)
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(glue)
+library(vip)
+library(baguette)
+```
+```{r}
+root  <- 'https://gdex.ucar.edu/dataset/camels/file'
+download.file('https://gdex.ucar.edu/dataset/camels/file/camels_attributes_v2.0.pdf', 
+              'data/camels_attributes_v2.0.pdf')
+```
+```{r}
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+remote_files  <- glue('{root}/camels_{types}.txt')
+local_files   <- glue('data/camels_{types}.txt')
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+camels <- map(local_files, read_delim, show_col_types = FALSE)
+camels <- power_full_join(camels ,by = 'gauge_id')
+```
+
+# Question 1:
+## According to the PDF, zero_q_freq represents the "frequency of days with Q = 0 mm/day" as a percentage, with Q representing discharge. 
+
+# Question 2:
+```{r}
+aridity <- ggplot(data = camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = aridity)) +
+  scale_color_gradient(low = "tan", high = "darkblue") +
+  ggthemes::theme_map() +
+  labs(title = "Gradient of Aridity Across the U.S. Computed from 1989-2009")
+
+p_mean <- ggplot(data = camels, aes(x = gauge_lon, y = gauge_lat)) +
+  borders("state", colour = "gray50") +
+  geom_point(aes(color = p_mean)) +
+  scale_color_gradient(low = "cadetblue1", high = "blue4") +
+  ggthemes::theme_map() +
+  labs(title = "Gradient of Mean Daily Precipitation Across the U.S. Computed from 1989-2009")
+
+library(ggpubr)
+ggarrange(aridity, p_mean, ncol= 1, nrow = 2)
+```
+
+```{r}
+camels |> 
+  select(aridity, p_mean, q_mean) |> 
+  drop_na() |> 
+  cor()
+
+ggplot(camels, aes(x = aridity, y = p_mean)) +
+  geom_point(aes(color = q_mean)) +
+  geom_smooth(method = "lm", color = "red", linetype = 2) +
+  scale_color_viridis_c() +
+  theme_linedraw() + 
+  theme(legend.position = "bottom") + 
+  labs(title = "Aridity vs Rainfall vs Runnoff", 
+       x = "Aridity", 
+       y = "Rainfall",
+       color = "Mean Flow")
+
+ggplot(camels, aes(x = aridity, y = p_mean)) +
+  geom_point(aes(color = q_mean)) +
+  geom_smooth(method = "lm") +
+  scale_color_viridis_c() +
+  scale_x_log10() + 
+  scale_y_log10() +
+  theme_linedraw() +
+  theme(legend.position = "bottom") + 
+  labs(title = "Aridity vs Rainfall vs Runnoff", 
+       x = "Aridity", 
+       y = "Rainfall",
+       color = "Mean Flow")
+
+ggplot(camels, aes(x = aridity, y = p_mean)) +
+  geom_point(aes(color = q_mean)) +
+  geom_smooth(method = "lm") +
+  scale_color_viridis_c(trans = "log") +
+  scale_x_log10() + 
+  scale_y_log10() +
+  theme_linedraw() +
+  theme(legend.position = "bottom",
+        legend.key.width = unit(2.5, "cm"),
+        legend.key.height = unit(.5, "cm")) + 
+  labs(title = "Aridity vs Rainfall vs Runnoff", 
+       x = "Aridity", 
+       y = "Rainfall",
+       color = "Mean Flow") 
+
+set.seed(123)
+camels <- camels |> 
+  mutate(logQmean = log(q_mean))
+camels_split <- initial_split(camels, prop = 0.8)
+camels_train <- training(camels_split)
+camels_test  <- testing(camels_split)
+camels_cv <- vfold_cv(camels_train, v = 10)
+
+rec <-  recipe(logQmean ~ aridity + p_mean, data = camels_train) %>%
+  step_log(all_predictors()) %>%
+  step_interact(terms = ~ aridity:p_mean) |> 
+  step_naomit(all_predictors(), all_outcomes())
+
+baked_data <- prep(rec, camels_train) |> 
+  bake(new_data = NULL)
+lm_base <- lm(logQmean ~ aridity * p_mean, data = baked_data)
+summary(lm_base)
+
+summary(lm(logQmean ~ aridity + p_mean + aridity_x_p_mean, data = baked_data))
+
+test_data <-  bake(prep(rec), new_data = camels_test)
+test_data$lm_pred <- predict(lm_base, newdata = test_data)
+metrics(test_data, truth = logQmean, estimate = lm_pred)
+
+ggplot(test_data, aes(x = logQmean, y = lm_pred, colour = aridity)) +
+  scale_color_gradient2(low = "brown", mid = "orange", high = "darkgreen") +
+  geom_point() +
+  geom_abline(linetype = 2) +
+  theme_linedraw() + 
+  labs(title = "Linear Model: Observed vs Predicted",
+       x = "Observed Log Mean Flow",
+       y = "Predicted Log Mean Flow",
+       color = "Aridity")
+
+lm_model <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+lm_wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(lm_model) %>%
+  fit(data = camels_train) 
+
+summary(extract_fit_engine(lm_wf))$coefficients
+summary(lm_base)$coefficients
+
+lm_data <- augment(lm_wf, new_data = camels_test)
+dim(lm_data)
+
+metrics(lm_data, truth = logQmean, estimate = .pred)
+ggplot(lm_data, aes(x = logQmean, y = .pred, colour = aridity)) +
+  scale_color_viridis_c() +
+  geom_point() +
+  geom_abline() +
+  theme_linedraw()
+
+library(baguette)
+rf_model <- rand_forest() %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+rf_wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(rf_model) %>%
+  fit(data = camels_train) 
+rf_data <- augment(rf_wf, new_data = camels_test)
+dim(rf_data)
+metrics(rf_data, truth = logQmean, estimate = .pred)
+ggplot(rf_data, aes(x = logQmean, y = .pred, colour = aridity)) +
+  scale_color_viridis_c() +
+  geom_point() +
+  geom_abline() +
+  theme_linedraw()
+
+wf <- workflow_set(list(rec), list(lm_model, rf_model)) %>%
+  workflow_map('fit_resamples', resamples = camels_cv) 
+autoplot(wf)
+rank_results(wf, rank_metric = "rsq", select_best = TRUE)
+```
+# Question 3:
+## I would move forward with the neural network model since it is ranked highest compared to the other three models. This ranking makes sense since the neural network model exhibits the highest rsq (R-squared value) and one of the lowest rmse (root mean square error). 
+```{r}
+boost_model <- boost_tree() %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+boost_wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(boost_model) %>%
+  fit(data = camels_train) 
+
+boost_data <- augment(boost_wf, new_data = camels_test)
+dim(boost_data)
+metrics(boost_data, truth = logQmean, estimate = .pred)
+ggplot(boost_data, aes(x = logQmean, y = .pred, colour = aridity)) +
+  scale_color_viridis_c() +
+  geom_point() +
+  geom_abline() +
+  theme_linedraw()
+
+nn_model <- bag_mlp() %>%
+  set_engine("nnet") %>%
+  set_mode("regression")
+nn_wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(nn_model) %>%
+  fit(data = camels_train) 
+
+nn_data <- augment(nn_wf, new_data = camels_test)
+dim(nn_data)
+metrics(nn_data, truth = logQmean, estimate = .pred)
+ggplot(nn_data, aes(x = logQmean, y = .pred, colour = aridity)) +
+  scale_color_viridis_c() +
+  geom_point() +
+  geom_abline() +
+  theme_linedraw()
+
+wf <- workflow_set(list(rec), list(lm_model, rf_model, boost_model, nn_model)) %>%
+  workflow_map('fit_resamples', resamples = camels_cv) 
+autoplot(wf)
+rank_results(wf, rank_metric = "rsq", select_best = TRUE)
+```
+
+# 4a. Data Splitting
+```{r}
+set.seed(210)
+camels <- camels |> 
+  mutate(logQmean = log(q_mean))
+
+camels_split_new <- initial_split(camels, prop = 0.75)
+camels_train_new <- training(camels_split)
+camels_test_new  <- testing(camels_split)
+
+camels_cv_new <- vfold_cv(camels_train_new, v = 10)
+```
+# 4b. Recipe: 
+## I chose the below formula because I observed a strong negative correlation between low precipitation frequency and mean discharge (-.715), and a medium-strong negative correlation between high precipitation frequency and mean discharge (-.669). I found these to be some of the strongest predictor variables when compared with mean discharge. Further, I chose these 2 because they made logical sense to me. A negative correlation between low prec. freq. and discharge makes sense as an increased frequency of low rainfall over a period of time will lead to decreased streamflow since less water accumulates. Although not intially intuitive, high precipitation frequency will result in decreased discharge as this large amount of rainfall will lead to more flashy streams, decreasing overall baseflow in the body of water and therefore decreasing total discharge. 
+```{r}
+## My formula: logQmean ~ high_prec_freq + low_prec_freq, data = camels_train_new
+
+my_rec <- recipe(logQmean ~ high_prec_freq + low_prec_freq, data = camels_train_new) %>%
+  step_log(all_predictors()) %>%
+  step_interact(terms = ~ high_prec_freq:low_prec_freq) |> 
+  step_naomit(all_predictors(), all_outcomes())
+
+camels |> 
+  select(low_prec_freq, high_prec_freq, q_mean) |> 
+  drop_na() |> 
+  cor()
+
+ggplot(camels, aes(x = high_prec_freq, y = low_prec_freq)) +
+  geom_point(aes(color = q_mean)) +
+  geom_smooth(method = "lm") +
+  scale_color_viridis_c(trans = "log") +
+  scale_x_log10() + 
+  scale_y_log10() +
+  theme_linedraw() +
+  theme(legend.position = "bottom",
+        legend.key.width = unit(2.5, "cm"),
+        legend.key.height = unit(.5, "cm")) + 
+  labs(title = "High Precipitation Freq. vs Low Precipitation Freq. vs Runnoff", 
+       x = "High Precipitation Frequency", 
+       y = "Low Precipitation Frequency",
+       color = "Mean flow") 
+```
+
+# 4c. Define 3 models:
+```{r}
+rf_model_new <- rand_forest() %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+
+lm_model_new <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+nn_model_new <- bag_mlp() %>%
+  set_engine("nnet") %>%
+  set_mode("regression")
+```
+
+# 4d. Workflow:
+```{r}
+my_wf <- workflow_set(list(my_rec), list(rf_model_new, lm_model_new, nn_model_new)) %>%
+  workflow_map('fit_resamples', resamples = camels_cv_new) 
+```
+
+# 4e. Evaluation:
+## I think the neural network model is best. According to the ranking tibble, this model has the highest R-squared (rsq) value when compared to the other models, indicating that this model does the best at explaning the variance among variables. Further, the neural network model has the lowest root mean squared error, indicating the lowest average error between predicted and actual results.
+```{r}
+autoplot(my_wf)
+rank_results(my_wf, rank_metric = "rsq", select_best = TRUE)
+```
+# 4f. Extract and evaluate:
+## The plot shows a relatively strong, positive correlation between actual (logQmean) and predicted (.pred) values of mean daily discharge according to my model, with the black diagnol line indicating what a perfect fit would look like. Since the dots are mostly clustered around this line, I would say that this model performed well, showing the ability to predict outcomes well. Since, the points fit the diagnol line better towards the higher values of logQmean, the model most likely predicts better when the mean discharge is higher. Overall, I would consider this model a viable option for analyzing my predictor and response variables.  
+```{r}
+nn_wf_new <- workflow() %>%
+  add_recipe(my_rec) %>%
+  add_model(nn_model_new) %>%
+  fit(data = camels_train_new) 
+
+nn_data_new <- augment(nn_wf_new, new_data = camels_test_new)
+dim(nn_data_new)
+metrics(nn_data_new, truth = logQmean, estimate = .pred)
+
+ggplot(nn_data_new, aes(x = logQmean, y = .pred, colour = high_prec_freq)) +
+  scale_color_gradient() +
+  geom_point() +
+  geom_abline() +
+  theme_linedraw()
+```
+
+
+
+
 
