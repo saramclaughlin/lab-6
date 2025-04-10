@@ -12,7 +12,7 @@ library(tidyverse)
 library(tidymodels)
 library(powerjoin)
 library(glue)
-library(vip)
+library(vip) 
 library(baguette)
 ```
 ```{r}
